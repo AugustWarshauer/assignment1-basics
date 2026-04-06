@@ -123,19 +123,28 @@ class RotaryPositionalEmbedding(nn.Module):
         """
         super().__init__()
         self.d_k = d_k
-        #computing just the first mini rotation matrix and then I'll apply it d/2 times recursivley to get my rotations 
-        #and ill know the next mini rotation matrices since i did the math and each mini rotation matrix changes angle of
-        #rotation by (theta^(-2/d)-1) each time so i can store rotation_1st, rotation_change, and again recursivly build 
-        #roration_2nd, etc, by applying rotation_change multiple times
         positions = torch.arange(max_seq_len, device=device, dtype=torch.float32)
-        theta = 1.0 / (theta**(2*torch.arange(1, self.d_k // 2, device=device)))
-        thetas = einsum(positions, theta, "p, t -> pt")
-        self.register_buffer('sin', torch.sin(torch.cat([thetas, -thetas], dim=1)), persistent=False)
-        self.register_buffer('cos', torch.cos(torch.cat([thetas, thetas], dim=1)), persistent=False)       
+        theta = 1.0 / (theta**((2*torch.arange(1, self.d_k // 2 + 1, device=device)-2)/self.d_k))
+        thetas = einsum(positions, theta, "p, t -> p t")
+        #thetas2 = torch.cat([thetas, thetas], dim=1) #This is the way it was done in stuff i looked at but fails cs336 test
+        thetas2 = repeat(thetas, "p t -> p (t repeat)", repeat = 2)
+        self.register_buffer('sin', torch.sin(thetas2), persistent=False)
+        self.register_buffer('cos', torch.cos(thetas2), persistent=False)       
 
+    # def _neg_half(self, x: torch.Tensor): #This is the way it was done in stuff i looked at but fails cs336 test
+    #     return torch.cat([-x[..., self.d_k//2:], x[..., :self.d_k//2]], dim=-1) # [x_1, x_2,...x_d] -> [-x_d/2, ... -x_d, x_1, ... x_d/2]
+    def _neg_half(self, x: torch.Tensor):
+        x1 = x[..., ::2]
+        x2 = x[..., 1::2]
+        return torch.stack((-x2, x1), dim=-1).flatten(start_dim=-2)
+        
     def forward(self, x: torch.Tensor, token_positions: torch.Tensor) -> torch.Tensor:
         """
         Processes an input tensor of shape (..., seq_len, d_k) and return a tensor of the same shape
         """
-        return x*self.cos[token_positions]+x*self.sin[token_positions]
         
+        return x*self.cos[token_positions]+self._neg_half(x)*self.sin[token_positions]
+    
+
+def softmax(x: torch.Tensor):
+    print('hi')
