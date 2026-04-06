@@ -112,7 +112,10 @@ class PositionwiseFeedForward(nn.Module):
     
 
 class RotaryPositionalEmbedding(nn.Module):
-    """applies RoPE to the input tensor. DISCLOSURE: I ended up getting stuck on matrix stuff and referenced an efficient implementation online to follow"""
+    """
+    applies RoPE to the input tensor. DISCLOSURE: I ended up getting stuck on matrix stuff and referenced an efficient implementation online to follow
+    intuition: https://www.youtube.com/watch?v=qKUobBR5R1A
+    """
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None): 
         """
         Params:
@@ -146,5 +149,41 @@ class RotaryPositionalEmbedding(nn.Module):
         return x*self.cos[token_positions]+self._neg_half(x)*self.sin[token_positions]
     
 
-def softmax(x: torch.Tensor):
-    print('hi')
+def softmax(x: torch.Tensor, i: int):
+    """
+    Params:
+        x (torch.Tensor)
+        i (int): dimension to apply softmax to
+    """ 
+    x -= torch.max(x, i, keepdim=True).values
+    x = torch.exp(x)
+    return x/torch.sum(x, i, keepdim=True)
+
+
+def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tensor, mask: torch.Tensor | None = None):
+    """
+    implements: Attention(Q, K, V) = softmax(QK^T/sqrt(d_k))V
+    intuition: attention is all you need paper, zero to hero karpathy, https://medium.com/@saraswatp/understanding-scaled-dot-product-attention-in-transformer-models-5fe02b0f150c
+
+    Params:
+        K (torch.Tensor): shape (batch_size, ..., seq_len, d_k) 
+        Q (torch.Tensor): shape (batch_size, ..., seq_len, d_k)
+        V (torch.Tensor): shape (batch_size, ..., seq_len, d_v)
+        mask (torch.Tensor | None): boolean mask of shape (seq_len, seq_len)
+    Returns:
+        output with shape (batch_size, ..., seq_len, d_v)
+    """
+    d_k = K.shape[-1] #key and query dimension
+    cos_similarity = einsum(K, Q, "batch ... k_seq_len d_k, batch ... q_seq_len d_k -> batch ... q_seq_len k_seq_len")/d_k**0.5
+
+    if mask is not None:
+        cos_similarity.masked_fill_(mask.logical_not(), float("-inf"))
+
+    return einsum(softmax(cos_similarity, -1), V, "batch ... q_seq_len k_seq_len, batch ... k_seq_len d_v -> batch ... q_seq_len d_v")
+
+
+
+
+
+
+
