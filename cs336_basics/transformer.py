@@ -119,7 +119,7 @@ class RotaryPositionalEmbedding(nn.Module):
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None): 
         """
         Params:
-            theta: float  Θ value for the RoPE
+            theta: float Θ value for the RoPE
             d_k: int  dimension of query and key vectors
             max_seq_len: int  Maximum sequence length that will be input
             device: torch.device | None = None  Device to store the buffer on
@@ -182,6 +182,54 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     return einsum(softmax(cos_similarity, -1), V, "batch ... q_seq_len k_seq_len, batch ... k_seq_len d_v -> batch ... q_seq_len d_v")
 
 
+class MultiHead_Self_Attention(nn.Module):
+
+    def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        """
+        d_model (int): Dimensionality of the Transformer block inputs
+        num_heads (int): Number of heads to use in multi-head self-attention
+        """
+
+        super().__init__()
+
+        self.d_k = int(d_model/num_heads) #d_k = d_v
+        self.num_heads = num_heads
+
+        self.W_q = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype)
+        self.W_k = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype)
+        self.W_v = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype)
+        self.W_o = Linear(d_model, num_heads*self.d_k, device=device, dtype=dtype)
+
+        self.RoPE = RotaryPositionalEmbedding(theta, self.d_k, max_seq_len, device=device)
+
+
+
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
+        """
+        Params:
+            x (torch.Tensor): has shape (batch_size, ..., seq_len, d_model)
+            token_positions (torch.Tensor): has shape (..., sequence_length) and is a 1d Tensor of integers
+        """
+        seq_len = x.shape[-2]
+
+        q = rearrange(self.W_q(x), "b ... seq_len (h d_k) -> b ... h seq_len d_k", h = self.num_heads)
+        k = rearrange(self.W_k(x), "b ... seq_len (h d_k) -> b ... h seq_len d_k", h = self.num_heads)
+        v = rearrange(self.W_v(x), "b ... seq_len (h d_k) -> b ... h seq_len d_k", h = self.num_heads)
+        
+
+        q = self.RoPE(q, token_positions)
+        k = self.RoPE(k, token_positions)
+                    
+        causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=bool))
+        attention = scaled_dot_product_attention(q, k, v, causal_mask) #(batch_size, ..., seq_len, d_v)
+        attention = rearrange(attention, "batch_size ... h seq_len d_v -> batch_size ... seq_len (h d_v)")
+
+        o = self.W_o(attention)
+        return o
+
+
+
+    
 
 
 
