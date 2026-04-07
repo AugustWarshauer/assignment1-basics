@@ -293,7 +293,20 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    transformed_weight_names = {
+    "attn.W_q.weights": weights["attn.q_proj.weight"],
+    "attn.W_k.weights": weights["attn.k_proj.weight"],
+    "attn.W_v.weights": weights["attn.v_proj.weight"],
+    "attn.W_o.weights": weights["attn.output_proj.weight"],
+    "ln1.rmsnorm_gains": weights["ln1.weight"],
+    "ffn.W1.weights": weights["ffn.w1.weight"],
+    "ffn.W2.weights": weights["ffn.w2.weight"],
+    "ffn.W3.weights": weights["ffn.w3.weight"],
+    "ln2.rmsnorm_gains": weights["ln2.weight"],
+    }
+    layer = Transformer_Block(d_model, num_heads, d_ff, max_seq_len, theta)
+    layer.load_state_dict(transformed_weight_names)
+    return layer(in_features)
 
 
 def run_transformer_lm(
@@ -320,7 +333,7 @@ def run_transformer_lm(
         num_heads (int): Number of heads to use in multi-headed attention. `d_model` must be
             evenly divisible by `num_heads`.
         d_ff (int): Dimensionality of the feed-forward inner layer (section 3.3).
-        rope_theta (float): The RoPE $\Theta$ parameter.
+        rope_theta (float): The RoPE Theta parameter.
         weights (dict[str, Tensor]):
             State dict of our reference implementation. {num_layers} refers to an
             integer between `0` and `num_layers - 1` (the layer index).
@@ -375,8 +388,41 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    # LOL chatgpt'd the adapter code below to save hella time
+    model = Transformer_LM(
+        vocab_size=vocab_size,
+        context_length=context_length,
+        num_layers=num_layers,
+        d_model=d_model,
+        num_heads=num_heads,
+        d_ff=d_ff,
+        max_seq_len=context_length,
+        theta=rope_theta,
+        #device=in_indices.device,
+        dtype=weights["token_embeddings.weight"].dtype,
+    )
+    transformed_weight_names = {
+        "token_embeddings.embedding_matrix": weights["token_embeddings.weight"],
+        "ln_final.rmsnorm_gains": weights["ln_final.weight"],
+        "lm_head.weights": weights["lm_head.weight"],
+    }
 
+    for layer_idx in range(num_layers):
+        transformed_weight_names.update({
+            f"layers.{layer_idx}.attn.W_q.weights": weights[f"layers.{layer_idx}.attn.q_proj.weight"],
+            f"layers.{layer_idx}.attn.W_k.weights": weights[f"layers.{layer_idx}.attn.k_proj.weight"],
+            f"layers.{layer_idx}.attn.W_v.weights": weights[f"layers.{layer_idx}.attn.v_proj.weight"],
+            f"layers.{layer_idx}.attn.W_o.weights": weights[f"layers.{layer_idx}.attn.output_proj.weight"],
+            f"layers.{layer_idx}.ln1.rmsnorm_gains": weights[f"layers.{layer_idx}.ln1.weight"],
+            f"layers.{layer_idx}.ffn.W1.weights": weights[f"layers.{layer_idx}.ffn.w1.weight"],
+            f"layers.{layer_idx}.ffn.W2.weights": weights[f"layers.{layer_idx}.ffn.w2.weight"],
+            f"layers.{layer_idx}.ffn.W3.weights": weights[f"layers.{layer_idx}.ffn.w3.weight"],
+            f"layers.{layer_idx}.ln2.rmsnorm_gains": weights[f"layers.{layer_idx}.ln2.weight"],
+        })
+    model.load_state_dict(transformed_weight_names)
+    with torch.no_grad():
+        return model(in_indices)
+    
 
 def run_rmsnorm(
     d_model: int,

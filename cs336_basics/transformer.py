@@ -8,7 +8,7 @@ class Linear(nn.Module):
         """
         y=Wx linear
 
-        Params:
+        Args:
             in_features (int): final dimension of the input 
             out_features (int): final dimension of the output
             device (torch.device | None):  Device to store the parameters on
@@ -36,11 +36,13 @@ class Embedding(nn.Module):
 
     def __init__(self, num_embeddings: int, embedding_dim: int, device=None, dtype=None):
         """
-        Params:
+        Args:
             num_embeddings (int):  Size of the vocabulary
             embedding_dim (int):  Dimension of the embedding vectors, i.e., 𝑑model
             device: torch.device (None):  Device to store the parameters on
             dtype: torch.dtype (None):  Data type of the parameters
+        Returns: 
+            torch.Tensor of shape (batch_size, sequence_length, d_model) (supports shape ..., d_model)
         """
         super().__init__()
         self.embedding_matrix = nn.Parameter(nn.init.trunc_normal_(
@@ -55,7 +57,7 @@ class Embedding(nn.Module):
         """
         Lookup the embedding vectors for the given token IDs
 
-        Params:
+        Args:
             token_ids (torch.LongTensor): A torch tensor.long of token IDs with shape (batch_size, sequence_length)
         Returns: 
             shape (batch_size, sequence_length, d_model)
@@ -73,7 +75,7 @@ class RMSnorm(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        params: 
+        Args: 
             x (torch.Tensor): is of shape (batch_size, sequence_length, d_model)
         """
         in_dtype = x.dtype
@@ -105,7 +107,7 @@ class PositionwiseFeedForward(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
-        params:
+        Args:
             x (torch.Tensor): input of shape (batch_size, sequence_length, d_model)
         """
         return self.W2(self._SiLu(self.W1(x))*self.W3(x))
@@ -118,7 +120,7 @@ class RotaryPositionalEmbedding(nn.Module):
     """
     def __init__(self, theta: float, d_k: int, max_seq_len: int, device: torch.device | None = None): 
         """
-        Params:
+        Args:
             theta: float Θ value for the RoPE
             d_k: int  dimension of query and key vectors
             max_seq_len: int  Maximum sequence length that will be input
@@ -151,7 +153,7 @@ class RotaryPositionalEmbedding(nn.Module):
 
 def softmax(x: torch.Tensor, i: int):
     """
-    Params:
+    Args:
         x (torch.Tensor)
         i (int): dimension to apply softmax to
     """ 
@@ -165,7 +167,7 @@ def scaled_dot_product_attention(Q: torch.Tensor, K: torch.Tensor, V: torch.Tens
     implements: Attention(Q, K, V) = softmax(QK^T/sqrt(d_k))V
     intuition: attention is all you need paper, zero to hero karpathy, https://medium.com/@saraswatp/understanding-scaled-dot-product-attention-in-transformer-models-5fe02b0f150c
 
-    Params:
+    Args:
         K (torch.Tensor): shape (batch_size, ..., seq_len, d_k) 
         Q (torch.Tensor): shape (batch_size, ..., seq_len, d_k)
         V (torch.Tensor): shape (batch_size, ..., seq_len, d_v)
@@ -186,8 +188,11 @@ class MultiHead_Self_Attention(nn.Module):
 
     def __init__(self, d_model: int, num_heads: int, max_seq_len: int, theta: float, device: torch.device | None = None, dtype: torch.dtype | None = None):
         """
-        d_model (int): Dimensionality of the Transformer block inputs
-        num_heads (int): Number of heads to use in multi-head self-attention
+        Args:
+            d_model (int): Dimensionality of the Transformer block inputs
+            num_heads (int): Number of heads to use in multi-head self-attention
+            max_seq_len (int):  Maximum sequence length that will be input
+            theta (float): value for the RoPE
         """
 
         super().__init__()
@@ -195,18 +200,17 @@ class MultiHead_Self_Attention(nn.Module):
         self.d_k = int(d_model/num_heads) #d_k = d_v
         self.num_heads = num_heads
 
-        self.W_q = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype)
-        self.W_k = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype)
-        self.W_v = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype)
-        self.W_o = Linear(d_model, num_heads*self.d_k, device=device, dtype=dtype)
+        self.W_q = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype) 
+        self.W_k = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype) 
+        self.W_v = Linear(num_heads*self.d_k, d_model, device=device, dtype=dtype) 
+        self.W_o = Linear(d_model, num_heads*self.d_k, device=device, dtype=dtype) 
 
         self.RoPE = RotaryPositionalEmbedding(theta, self.d_k, max_seq_len, device=device)
 
 
-
-    def forward(self, x: torch.Tensor, token_positions: torch.Tensor):
+    def forward(self, x: torch.Tensor, token_positions: torch.Tensor | None = None):
         """
-        Params:
+        Args:
             x (torch.Tensor): has shape (batch_size, ..., seq_len, d_model)
             token_positions (torch.Tensor): has shape (..., sequence_length) and is a 1d Tensor of integers
         """
@@ -216,10 +220,12 @@ class MultiHead_Self_Attention(nn.Module):
         k = rearrange(self.W_k(x), "b ... seq_len (h d_k) -> b ... h seq_len d_k", h = self.num_heads)
         v = rearrange(self.W_v(x), "b ... seq_len (h d_k) -> b ... h seq_len d_k", h = self.num_heads)
         
-
+        if token_positions is None:
+            token_positions = torch.arange(seq_len, device=x.device)
         q = self.RoPE(q, token_positions)
         k = self.RoPE(k, token_positions)
-                    
+        
+
         causal_mask = torch.tril(torch.ones(seq_len, seq_len, dtype=bool))
         attention = scaled_dot_product_attention(q, k, v, causal_mask) #(batch_size, ..., seq_len, d_v)
         attention = rearrange(attention, "batch_size ... h seq_len d_v -> batch_size ... seq_len (h d_v)")
@@ -228,8 +234,70 @@ class MultiHead_Self_Attention(nn.Module):
         return o
 
 
+class Transformer_Block(nn.Module):
 
-    
+    def __init__(self, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        """
+        Args:
+            d_model (int): Dimensionality of the Transformer block inputs
+            num_heads (int): Number of heads to use in multi-head self-attention
+            d_ff (int): Dimensionality of the position-wise feed-foward inner layer
+            max_seq_len (int):  Maximum sequence length that will be input
+            theta (float): value for the RoPE
+        """
+        super().__init__()
+
+        self.ln1 = RMSnorm(d_model, device=device, dtype=dtype)
+        self.ln2 = RMSnorm(d_model, device=device, dtype=dtype)
+        self.attn = MultiHead_Self_Attention(d_model, num_heads, max_seq_len, theta, device=device, dtype=dtype)
+        self.ffn = PositionwiseFeedForward(d_model, d_ff, device=device, dtype=dtype)
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x (torch.Tensor): shape (batch_size, ..., seq_len, d_model)
+        Returns: 
+            z (torch.Tensor): shape (batch_size, ..., seq_len, d_model)
+        """
+        y = x + self.attn(self.ln1(x))
+        z = y + self.ffn(self.ln2(y))
+        return z 
+
+
+class Transformer_LM(nn.Module):
+
+    def __init__(self, vocab_size: int, context_length: int, num_layers: int, d_model: int, num_heads: int, d_ff: int, max_seq_len: int, theta: float, device: torch.device | None = None, dtype: torch.dtype | None = None):
+        """
+        Args:
+            vocab_size (int): The size of the vocabulary, necessary for determining the dimensionality of the token embedding matrix
+            context_length (int): The maximum context length, necessary for determining the dimensionality of the RoPE sin and cos buffer
+            num_layers (int): The number of Transformer blocks to use
+            d_model (int): Dimensionality of the Transformer block inputs
+            num_heads (int): Number of heads to use in multi-head self-attention
+            d_ff (int): Dimensionality of the position-wise feed-foward inner layer
+            max_seq_len (int):  Maximum sequence length that will be input
+            theta (float): value for the RoPE
+        Returns:
+            torch.Tensor of shape (batch, ..., seq_length, vocab_size) of causal next-token logits
+        """
+        super().__init__()
+        
+        self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
+        self.layers = nn.Sequential(*[Transformer_Block(d_model, num_heads, d_ff, max_seq_len, theta, device=device, dtype=dtype) for _ in range(num_layers)])
+        self.ln_final = RMSnorm(d_model, device=device, dtype=dtype) #final layer norm 
+        self.lm_head = Linear(d_model, vocab_size, device=device, dtype=dtype) #final linear layer producing logits
+
+    def forward(self, x: torch.Tensor):
+        """
+        Args:
+            x (torch.Tensor): A torch tensor.long of token IDs with shape (batch_size, sequence_length)
+        """
+        x = self.token_embeddings(x)
+        x = self.layers(x)
+        x = self.ln_final(x)
+        logits = self.lm_head(x)
+        return logits
+
 
 
 
