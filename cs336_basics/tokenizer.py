@@ -270,7 +270,8 @@ class Tokenizer():
 
     def encode(self, text: str) -> list[int]:
         """Encode an input text into a sequence of token IDs."""
-        #TODO: make parallelizable 
+        #TODO: make parallelizable
+        # TODO TODO index my adjacencies so i don't have to loop over corpus each time bit can go directly to places counts change
         merges_remaining = self.merges.copy()
         corpus: list[tuple[bytes, ...]] = []
         out: list[int] = []
