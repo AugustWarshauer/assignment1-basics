@@ -229,7 +229,6 @@ def BPE_Tokenizer_Training(input_path: str, vocab_size: int, special_tokens: lis
     return vocab, merges_without_id
                 
 
-
 class Tokenizer():
     """Tokenizer class that has encoding, decoding"""
 

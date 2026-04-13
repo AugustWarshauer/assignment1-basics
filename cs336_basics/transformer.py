@@ -277,11 +277,14 @@ class Transformer_LM(nn.Module):
             d_ff (int): Dimensionality of the position-wise feed-foward inner layer
             max_seq_len (int):  Maximum sequence length that will be input
             theta (float): value for the RoPE
+            device
+            dtype: dtype for layers weights
         Returns:
             torch.Tensor of shape (batch, ..., seq_length, vocab_size) of causal next-token logits
         """
         super().__init__()
-        
+        self.d_model = d_model
+
         self.token_embeddings = Embedding(vocab_size, d_model, device=device, dtype=dtype)
         self.layers = nn.Sequential(*[Transformer_Block(d_model, num_heads, d_ff, max_seq_len, theta, device=device, dtype=dtype) for _ in range(num_layers)])
         self.ln_final = RMSnorm(d_model, device=device, dtype=dtype) #final layer norm 
