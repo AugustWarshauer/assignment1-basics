@@ -4,8 +4,8 @@ from einops import rearrange, einsum, reduce, repeat
 from collections.abc import Callable, Iterable
 from typing import Optional
 import numpy as np
-from tokenizer import Tokenizer
-from transformer import softmax
+from cs336_basics.tokenizer import Tokenizer
+from cs336_basics.transformer import softmax
 
 def cross_entropy(logits: torch.Tensor, targets: torch.Tensor):
     """
@@ -15,7 +15,7 @@ def cross_entropy(logits: torch.Tensor, targets: torch.Tensor):
     Returns:
         average cross-entropy loss
     """
-    logits -= torch.max(logits, -1, keepdim=True).values
+    logits = logits - torch.max(logits, -1, keepdim=True).values
     logit_sums = torch.log(reduce(torch.exp(logits), "... s v -> ... s", "sum"))
     target_logits = logits.gather(dim = -1, index=rearrange(targets, "... s -> ... s 1"))
     target_logits = rearrange(target_logits, "... s 1 -> ... s")
@@ -83,12 +83,14 @@ class AdamW(torch.optim.Optimizer):
                     continue
                 grad = p.grad.data  # Get the gradient of loss with respect to p
                 state = self.state[p]  # Get state associated with p
-                p.data -= group["lr"] * group["weight_decay"] * p.data  # apply weight decay (regularization towards 0)
-                m = beta1 * state.get("m", 0) + (1 - beta1) * grad  # First moment estimate update
-                state["m"] = m
-                v = beta2 * state.get("v", 0) + (1 - beta2) * grad**2  # Second moment estimate update
-                state["v"] = v
-                p.data -= alpha_t * m / (torch.sqrt(v) + group["eps"])  # Applying moment-adjusted weight updates
+                if "m" not in state:
+                    state["m"] = torch.zeros_like(p.data)
+                    state["v"] = torch.zeros_like(p.data)
+                m, v = state["m"], state["v"]
+                p.data.mul_(1 - group["lr"] * group["weight_decay"])  # apply weight decay (regularization towards 0)
+                m.mul_(beta1).add_(grad, alpha=1 - beta1)  # First moment estimate update
+                v.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)  # Second moment estimate update
+                p.data.addcdiv_(m, v.sqrt().add_(group["eps"]), value=-alpha_t)  # Applying moment-adjusted weight updates
         return loss
 
 
@@ -132,12 +134,13 @@ def load_checkpoint(src, model: torch.nn.Module, optimizer: torch.optim.Optimize
     Returns:
         int: The iteration number saved in the checkpoint
     """
-    checkpoint = torch.load(src, weights_only=False)
+    checkpoint = torch.load(src, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"])
     optimizer.load_state_dict(checkpoint["optimizer"])
     return checkpoint["iteration"]
 
 
+@torch.no_grad()
 def decoding(model: nn.Module, tokenizer: Tokenizer, prompt: str, temp: float | None = None, top_p: float | None = None, max_generated: int | None = None, end_token: str = "<|endoftext|>") -> Iterable:
     """
     Args:
@@ -152,22 +155,19 @@ def decoding(model: nn.Module, tokenizer: Tokenizer, prompt: str, temp: float | 
         Iterable for next token vocab integer id
     """
 
-    encoded_prompt = tokenizer.encode(prompt)
-    
-    if len(encoded_prompt) > model.d_model:
-        encoded_prompt = encoded_prompt[-model.d_model:]
-    elif len(encoded_prompt) < model.d_model:
-        encoded_prompt = [tokenizer.reverse_vocab[b'\x00']] * (model.d_model - len(encoded_prompt)) + encoded_prompt
+    device = next(model.parameters()).device
+    context_length = model.context_length
 
-    x = torch.tensor(encoded_prompt).unsqueeze(0)
+    encoded_prompt = tokenizer.encode(prompt)
+    x = torch.tensor(encoded_prompt, dtype=torch.long, device=device).unsqueeze(0)
     t = 0 #start at 0 generations
 
     end_token_id = tokenizer.reverse_vocab[end_token.encode("utf-8")]  # adjust if your tokenizer needs bytes
 
     while max_generated is None or t < max_generated:
-        logits = model(x) #returns size (batch_len, seq_len, vocab_size)
+        logits = model(x[:, -context_length:]) #returns size (batch_len, seq_len, vocab_size)
         logits = logits[0, -1] #pick out the end of seq_length output
-        
+
         if temp is not None:
             if temp <= 0:
                 raise ValueError("temp must be > 0")
@@ -182,7 +182,7 @@ def decoding(model: nn.Module, tokenizer: Tokenizer, prompt: str, temp: float | 
             sorted_probs, sorted_indices = torch.sort(probs, descending=True)
             cumulative_probs = torch.cumsum(sorted_probs, dim=0)
 
-            keep_mask = cumulative_probs <= top_p
+            keep_mask = (cumulative_probs - sorted_probs) < top_p #exclusive cumsum: keeps the token that crosses top_p
             keep_mask[0] = True
 
             probs_top_p = torch.zeros_like(probs)
@@ -190,15 +190,15 @@ def decoding(model: nn.Module, tokenizer: Tokenizer, prompt: str, temp: float | 
 
             probs = probs_top_p
 
-        next_token = torch.multinomial(probs, num_samples=1).item()
-        if next_token == end_token_id:
+        next_token = torch.multinomial(probs, num_samples=1) #shape (1,)
+        next_id = int(next_token.item())
+        if next_id == end_token_id:
             break
-        
-        yield next_token
-        t+=1
 
+        yield next_id
+        t += 1
 
-        x = torch.cat([x[:, 1:], next_token.view(x.size(0), 1)], dim=1)
+        x = torch.cat([x, next_token.view(1, 1)], dim=1)
 
 
 

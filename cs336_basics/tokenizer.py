@@ -3,10 +3,13 @@ import regex as re
 import time
 import pickle
 from typing import BinaryIO
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Iterable, Iterator
 from multiprocessing import Pool
+from cs336_basics.claude_suggested_speedups import PretokenEncoder, run_bpe_merges, stream_encode
 
+# module level so encode_iterable cuts the stream on exactly the same pretoken boundaries as pretokenize
+GPT2_PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
 
 def find_chunk_boundaries(
@@ -68,7 +71,7 @@ def pretokenize(chunk: str, special_tokens: list[str], encoding: bool = False) -
         r"""\s+"""
     ]
     
-    GPT2_pattern = [r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""]
+    GPT2_pattern = [GPT2_PAT]
     
     special_pat = "|".join(re.escape(tok) for tok in special_tokens)
 
@@ -118,58 +121,23 @@ def merge_chunk(chunk, pair_to_merge, new_token):
 
     return tuple(out), changed
 
-def update_pair_counts(byte_pair_frequencies, chunk, freq, delta):
-    for pair in zip(chunk, chunk[1:]):
-        byte_pair_frequencies[pair] += delta * freq
-        if byte_pair_frequencies[pair] == 0:
-            del byte_pair_frequencies[pair]
-    return byte_pair_frequencies
-
-def merge(regex_chunk_table, byte_pair_frequencies, merges):
-    pair_to_merge, new_token = merges[-1]
-    new_regex_chunk_table = {}
-
-    for chunk, freq in regex_chunk_table.items():
-        new_chunk, changed = merge_chunk(chunk, pair_to_merge, new_token)
-
-        if changed:
-            byte_pair_frequencies = update_pair_counts(byte_pair_frequencies, chunk, freq, -1)
-            byte_pair_frequencies = update_pair_counts(byte_pair_frequencies, new_chunk, freq, 1)
-
-        new_regex_chunk_table[new_chunk] = new_regex_chunk_table.get(new_chunk, 0) + freq
-
-    return new_regex_chunk_table, byte_pair_frequencies
-
-def resolve_token(token, vocab):
-    value = vocab[token]
-    if isinstance(value, bytes):
-        return value
-    left, right = value
-    return resolve_token(left, vocab) + resolve_token(right, vocab)
-
-def pretokenization_work(input_path, start, end, special_tokens):
-    local_regex_chunk_table = defaultdict(int)
-    local_byte_pair_frequencies = defaultdict(int)
-
-    with open(input_path, "rb") as f:   
+def pretokenization_work(task) -> dict[tuple[int, ...], int]:
+    input_path, start, end, special_tokens = task
+    with open(input_path, "rb") as f:
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
 
-    for regex_chunk in pretokenize(chunk, special_tokens):
-        regex_chunk_bytes = tuple(regex_chunk.encode("utf-8"))
-        local_regex_chunk_table[regex_chunk_bytes] += 1
-        for i in zip(regex_chunk_bytes, regex_chunk_bytes[1:]):
-            local_byte_pair_frequencies[i] += 1
+    counts = Counter(pretokenize(chunk, special_tokens))
+    return {tuple(pretoken.encode("utf-8")): n for pretoken, n in counts.items()}
 
-    return local_regex_chunk_table, local_byte_pair_frequencies
-
-def BPE_Tokenizer_Training(input_path: str, vocab_size: int, special_tokens: list[str], parallelize: bool = False):
+def BPE_Tokenizer_Training(input_path: str, vocab_size: int, special_tokens: list[str], parallelize: bool = False, chunk_bytes: int = 32 * 1024 * 1024):
     """BPE Tokenizer training that allows for parallelizable training
     Args: 
         input_path (str): path to a txt file
         vocab size (int): desired final vocab_size, must be more than 256 as that is default for utf-8 bytes
         special_tokens (list[str]): list of special tokens that will not be split in final vocab
         parralelize (bool): whether to parrallelize the pretokenization work on all but one core of your device
+        chunk_bytes (int): target size of each pretokenization chunk, which bounds memory per worker
     Returns:  
         vocab (dict[int, bytes]): the integer id to bytes of our final vocabulary
         merges (list[tuple[bytes,bytes]]): a chronological (lower index = earlier) list of merges of pairs of bytes
@@ -177,51 +145,34 @@ def BPE_Tokenizer_Training(input_path: str, vocab_size: int, special_tokens: lis
 
     with open(input_path, "rb") as f:
         num_processes = max(1, (os.process_cpu_count() or 1) - 1)
-        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
-    
+        file_size = os.fstat(f.fileno()).st_size
+        num_chunks = max(num_processes, file_size // chunk_bytes)
+        boundaries = find_chunk_boundaries(f, num_chunks, b"<|endoftext|>")
+
     print(f'Time at start: {time.perf_counter()}')
-    
+
     vocab = vocab_init(special_tokens)
-    regex_chunk_table: dict[tuple[bytes], int] = defaultdict(int) # this will store all regex chunks and their frequencies 
-    byte_pair_frequencies: dict[tuple[bytes], int] = defaultdict(int)
-    merges: list[(tuple[bytes], bytes)] = []
+    regex_chunk_table: dict[tuple[int, ...], int] = defaultdict(int) # this will store all regex chunks and their frequencies
 
     print(f'Time before pretok: {time.perf_counter()}')
 
+    tasks = [
+        (input_path, start, end, special_tokens)
+        for start, end in zip(boundaries[:-1], boundaries[1:])
+    ]
     if parallelize:
-        tasks = [
-            (input_path, start, end, special_tokens)
-            for start, end in zip(boundaries[:-1], boundaries[1:])
-        ]
         with Pool(num_processes) as p:
-                results = p.starmap(pretokenization_work, tasks)    
-        # combine worker outputs
-        for local_regex_chunk_table, local_byte_pair_frequencies in results:
-            for k, v in local_regex_chunk_table.items():
+            for local_regex_chunk_table in p.imap_unordered(pretokenization_work, tasks):
+                for k, v in local_regex_chunk_table.items():
+                    regex_chunk_table[k] += v
+    else:
+        for task in tasks:
+            for k, v in pretokenization_work(task).items():
                 regex_chunk_table[k] += v
-            for k, v in local_byte_pair_frequencies.items():
-                byte_pair_frequencies[k] += v
-    else: 
-        for start, end in zip(boundaries[:-1], boundaries[1:]):
-            local_regex_chunk_table, local_byte_pair_frequencies = pretokenization_work(input_path, start, end, special_tokens)
 
-            for k, v in local_regex_chunk_table.items():
-                regex_chunk_table[k] += v
-            for k, v in local_byte_pair_frequencies.items():
-                byte_pair_frequencies[k] += v
-    
     print(f'Time after pretok: {time.perf_counter()}')
 
-
-    while len(vocab) < vocab_size: 
-
-        best_pair, best_pair_frequency = max(byte_pair_frequencies.items(), key=lambda x: (x[1], (vocab[x[0][0]], vocab[x[0][1]]))) #max function will lexographically tiebreak
-        new_token_id = max(vocab.items(), key=lambda x: x[0])[0]+1
-            
-        left, right = best_pair
-        vocab[new_token_id] = resolve_token(left, vocab) + resolve_token(right, vocab)
-        merges.append((best_pair, new_token_id))
-        regex_chunk_table, byte_pair_frequencies = merge(regex_chunk_table, byte_pair_frequencies, merges)
+    merges = run_bpe_merges(regex_chunk_table, vocab, vocab_size, merge_chunk)
 
     print(f'Time after merges: {time.perf_counter()}')
 
@@ -232,28 +183,23 @@ def BPE_Tokenizer_Training(input_path: str, vocab_size: int, special_tokens: lis
 class Tokenizer():
     """Tokenizer class that has encoding, decoding"""
 
-    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = [], parallelize: bool = False):
+    def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None, parallelize: bool = False, pretoken_cache_size: int = 4096):
         self.vocab = vocab
         self.reverse_vocab: dict[bytes, int] = {v:k for k, v in self.vocab.items()}
         self.merges = merges
-        self.special_tokens = special_tokens
-        if special_tokens is None:
-            self.special_tokens = []
-        self.special_tokens.sort(key = lambda x: len(x), reverse=True) #sorts by length for overlapping token edge case is handeled in encode_iterable
-
-        self.tuple_special_tokens: set[tuple[bytes, ...]] = {
-            tuple(bytes([b]) for b in special_token.encode("utf-8"))
-            for special_token in self.special_tokens}
+        self.special_tokens: list[str] = sorted(special_tokens or [], key=len, reverse=True) #sorts by length for overlapping token edge case
+        self.special_token_set: set[str] = set(self.special_tokens)
         self.parallelize = parallelize
+        self._pretoken_encoder = PretokenEncoder(self.merges, self.reverse_vocab, self.replace_pair, pretoken_cache_size)
     
     @classmethod
-    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens=None, parallelize: bool = False):
+    def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens=None, parallelize: bool = False, pretoken_cache_size: int = 4096):
         """method that constructs and return a Tokenizer from a serialized vocabulary and list of merge"""
         with open(vocab_filepath, "rb") as f:
             vocab = pickle.load(f)
         with open(merges_filepath, "rb") as f:
             merges = pickle.load(f)
-        return Tokenizer(vocab, merges, special_tokens, parallelize)
+        return Tokenizer(vocab, merges, special_tokens, parallelize, pretoken_cache_size)
     
     def replace_pair(self, seq: tuple[bytes, ...], pair: tuple[bytes, bytes], new: bytes):
         out: list = []
@@ -270,55 +216,20 @@ class Tokenizer():
     def encode(self, text: str) -> list[int]:
         """Encode an input text into a sequence of token IDs."""
         #TODO: make parallelizable
-        # TODO TODO index my adjacencies so i don't have to loop over corpus each time bit can go directly to places counts change
-        merges_remaining = self.merges.copy()
-        corpus: list[tuple[bytes, ...]] = []
         out: list[int] = []
-
-        for regex_chunk in pretokenize(text, self.special_tokens, encoding=True):
-            corpus.append(tuple(bytes([b]) for b in regex_chunk.encode('utf-8')))
-
-        while len(merges_remaining) > 0: 
-            for i, mini_text in enumerate(corpus): 
-                if mini_text in self.tuple_special_tokens:
-                    continue
-                else: 
-                    corpus[i] = self.replace_pair(mini_text, merges_remaining[0], merges_remaining[0][0]+merges_remaining[0][1])
-            del merges_remaining[0]
-
-        for i, mini_text in enumerate(corpus): 
-            if mini_text in self.tuple_special_tokens:
-                out.append(self.reverse_vocab[b''.join(mini_text)])
+        for pretoken in pretokenize(text, self.special_tokens, encoding=True):
+            if pretoken in self.special_token_set:
+                out.append(self.reverse_vocab[pretoken.encode("utf-8")])
             else:
-                for j in mini_text:
-                    out.append(self.reverse_vocab[j])
-        
+                out.extend(self._pretoken_encoder(pretoken))
         return out
 
-    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+    def encode_iterable(self, iterable: Iterable[str], read_chars: int = 16_384, max_buffer_chars: int = 1 << 20) -> Iterator[int]:
         """Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs.
         This is required for memory-efficient tokenization of large files that we cannot directly load into memory.
-        
-        Not sure if this is what it wants, because you would ***NEED TO*** break up the text at places where you know no
-        merges will cross (ex: special tokens) in your iterable input
-        
-        But also this breaks it up into even smaller sections now
         """
         #TODO parallelize
-        buffer = ""
-
-        for chunk in iterable:
-            buffer += chunk
-
-            while any(tok in buffer for tok in self.special_tokens):
-                indexes = sorted([(buffer.index(tok), tok) for tok in self.special_tokens if tok in buffer], key=lambda x: x[0])
-                idx = indexes[0][0]+len(indexes[0][1])
-                safe_text = buffer[:idx]
-                buffer = buffer[idx:]
-                yield from self.encode(safe_text)
-
-        if buffer:
-            yield from self.encode(buffer)
+        yield from stream_encode(iterable, self.encode, self.special_tokens, GPT2_PAT, read_chars, max_buffer_chars)
 
     def decode(self, ids: list[int]) -> str:
         """Decode a sequence of token IDs into text."""

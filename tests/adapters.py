@@ -150,7 +150,14 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    layer = MultiHead_Self_Attention(d_model, num_heads, use_rope=False)
+    layer.load_state_dict({
+        "W_q.weights": q_proj_weight,
+        "W_k.weights": k_proj_weight,
+        "W_v.weights": v_proj_weight,
+        "W_o.weights": o_proj_weight,
+    })
+    return layer(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -461,7 +468,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
+    return PositionwiseFeedForward._SiLu(in_features)
 
 
 def run_get_batch(
